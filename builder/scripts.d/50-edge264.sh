@@ -13,7 +13,13 @@ ffbuild_dockerbuild() {
     cd edge264
 
     make clean || true
-    make libedge264.a
+
+    # Build object file (with logs variant for runtime intrinsics selection)
+    make edge264.o edge264_headers_log.o VARIANTS=logs BUILD_TEST=no
+
+    # Create static library from object files
+    ar rcs libedge264.a edge264.o edge264_headers_log.o
+    ranlib libedge264.a
 
     mkdir -p "$FFBUILD_PREFIX/lib"
     mkdir -p "$FFBUILD_PREFIX/include"
