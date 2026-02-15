@@ -1121,6 +1121,7 @@ OBJS-$(CONFIG_LIBCODEC2_DECODER)          += libcodec2.o
 OBJS-$(CONFIG_LIBCODEC2_ENCODER)          += libcodec2.o
 OBJS-$(CONFIG_LIBDAV1D_DECODER)           += libdav1d.o av1_parse.o
 OBJS-$(CONFIG_LIBDAVS2_DECODER)           += libdavs2.o
+OBJS-$(CONFIG_LIBEDGE264_DECODER)         += libedge264dec.o
 OBJS-$(CONFIG_LIBFDK_AAC_DECODER)         += libfdk-aacdec.o
 OBJS-$(CONFIG_LIBFDK_AAC_ENCODER)         += libfdk-aacenc.o
 OBJS-$(CONFIG_LIBGSM_DECODER)             += libgsmdec.o
