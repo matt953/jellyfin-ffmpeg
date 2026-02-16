@@ -317,7 +317,8 @@ static int output_frame(AVCodecContext *avctx, AVFrame *avframe,
         const uint8_t *src[4] = { frame->samples[0], frame->samples[1], frame->samples[2], NULL };
         int src_linesize[4] = { frame->stride_Y, frame->stride_C, frame->stride_C, 0 };
 
-        av_image_copy2(avframe->data, avframe->linesize, src, src_linesize,
+        // av_image_copy2 only reads from src; cast away const to match API signature
+        av_image_copy2(avframe->data, avframe->linesize, (uint8_t * const *)src, src_linesize,
                        avctx->pix_fmt, avctx->width, avctx->height);
     }
 

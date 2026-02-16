@@ -5,6 +5,7 @@ SCRIPT_COMMIT="0b7b7375f043a614162c7e2ff362d5c6a5342029"
 
 ffbuild_enabled() {
     [[ $TARGET == mac* ]] && return 0
+    [[ $TARGET == linux* ]] && return 0
     return 1
 }
 
