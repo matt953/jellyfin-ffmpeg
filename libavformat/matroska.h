@@ -363,6 +363,7 @@ typedef enum {
   MATROSKA_BLOCK_ADD_ID_TYPE_ITU_T_T35              = 4,
   MATROSKA_BLOCK_ADD_ID_TYPE_DVCC                   = 0x64766343, // MKBETAG('d','v','c','C')
   MATROSKA_BLOCK_ADD_ID_TYPE_DVVC                   = 0x64767643, // MKBETAG('d','v','v','C')
+  MATROSKA_BLOCK_ADD_ID_TYPE_MVCC                   = 0x6d766343, // MKBETAG('m','v','c','C') - MVC
 } MatroskaBlockAddIDType;
 
 #define MATROSKA_BLOCK_ADD_ID_OPAQUE 1

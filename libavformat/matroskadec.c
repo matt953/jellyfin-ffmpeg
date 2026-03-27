@@ -2537,6 +2537,18 @@ static int mkv_parse_block_addition_mappings(AVFormatContext *s, AVStream *st, M
                 return ret;
 
             break;
+        case MATROSKA_BLOCK_ADD_ID_TYPE_MVCC:
+            av_log(s, AV_LOG_DEBUG,
+                   "MVC Block Addition Mapping found, value %"PRIu64", name \"%s\"\n",
+                   mapping->value, mapping->name ? mapping->name : "");
+            // Some MVC files incorrectly use value=0 instead of a proper BlockAddIDValue
+            // Fix it to 1 so block additions can be matched properly
+            if (mapping->value == 0) {
+                av_log(s, AV_LOG_WARNING,
+                       "MVC Block Addition Mapping has invalid value 0, assuming 1\n");
+                mapping->value = 1;
+            }
+            break;
         default:
             av_log(s, AV_LOG_DEBUG,
                    "Unknown Block Addition Mapping type 0x%"PRIx64", value %"PRIu64", name \"%s\"\n",
@@ -4040,11 +4052,18 @@ static int matroska_parse_frame(MatroskaDemuxContext *matroska,
     pkt->flags        = is_keyframe;
     pkt->stream_index = st->index;
 
+    {
+        static int debug_count = 0;
+        if (debug_count++ < 20)
+            av_log(matroska->ctx, AV_LOG_WARNING, "[MKV_BLOCK] pkt_size=%d nb_blockmore=%d\n", pkt_size, nb_blockmore);
+    }
     for (int i = 0; i < nb_blockmore; i++) {
         MatroskaBlockMore *more = &blockmore[i];
 
         if (!more->additional.size)
             continue;
+        av_log(matroska->ctx, AV_LOG_WARNING, "[MKV_BLOCK] BlockMore[%d] id=%"PRIu64" size=%d\n",
+               i, more->additional_id, more->additional.size);
 
         res = matroska_parse_block_additional(matroska, track, pkt, more->additional.data,
                                               more->additional.size, more->additional_id);
