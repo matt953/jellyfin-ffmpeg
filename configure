@@ -227,6 +227,7 @@ External library support:
   --enable-libdav1d        enable AV1 decoding via libdav1d [no]
   --enable-libdavs2        enable AVS2 decoding via libdavs2 [no]
   --enable-libedge264      enable H.264/MVC decoding via edge264 [no]
+  --enable-libldecod-jm    enable H.264/MVC decoding via JM reference decoder [no]
   --enable-libdc1394       enable IIDC-1394 grabbing using libdc1394
                            and libraw1394 [no]
   --enable-libdvdnav       enable libdvdnav, needed for DVD demuxing [no]
@@ -1919,6 +1920,7 @@ EXTERNAL_LIBRARY_LIST="
     libcodec2
     libdav1d
     libedge264
+    libldecod_jm
     libdc1394
     libflite
     libfontconfig
@@ -3530,6 +3532,8 @@ libdav1d_decoder_deps="libdav1d"
 libdav1d_decoder_select="atsc_a53 dovi_rpudec"
 libedge264_decoder_deps="libedge264"
 libedge264_decoder_select="h264_mp4toannexb_bsf"
+libldecod_jm_decoder_deps="libldecod_jm"
+libldecod_jm_decoder_select="h264_mp4toannexb_bsf"
 libdavs2_decoder_deps="libdavs2"
 libdavs2_decoder_select="avs2_parser"
 libfdk_aac_decoder_deps="libfdk_aac"
@@ -6908,6 +6912,7 @@ enabled libcodec2         && require libcodec2 codec2/codec2.h codec2_create -lc
 enabled libdav1d          && require_pkg_config libdav1d "dav1d >= 0.5.0" "dav1d/dav1d.h" dav1d_version
 enabled libdavs2          && require_pkg_config libdavs2 "davs2 >= 1.6.0" davs2.h davs2_decoder_open
 enabled libedge264        && require libedge264 edge264.h edge264_alloc -ledge264
+enabled libldecod_jm      && require libldecod_jm ldecod/h264decoder.h OpenDecoder -lldecod -lm -lpthread
 enabled libdc1394         && require_pkg_config libdc1394 libdc1394-2 dc1394/dc1394.h dc1394_new
 enabled libdrm            && check_pkg_config libdrm libdrm xf86drm.h drmGetVersion
 enabled libdvdnav         && require_pkg_config libdvdnav "dvdnav >= 6.1.1" dvdnav/dvdnav.h dvdnav_open2

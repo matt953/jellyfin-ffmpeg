@@ -155,6 +155,9 @@ typedef struct InputFilterPriv {
 
         ///< marks if sub2video_update should force an initialization
         unsigned int initialize;
+
+        int  plane_3d;       /* OFMD 3d-plane index for this subtitle stream */
+        int  plane_3d_valid; /* whether plane_3d has been set */
     } sub2video;
 } InputFilterPriv;
 
@@ -321,6 +324,14 @@ static void sub2video_push_ref(InputFilterPriv *ifp, int64_t pts)
 
     av_assert1(frame->data[0]);
     ifp->sub2video.last_pts = frame->pts = pts;
+
+    /* Propagate 3d-plane metadata for overlay_sbs filter */
+    if (ifp->sub2video.plane_3d_valid) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", ifp->sub2video.plane_3d);
+        av_dict_set(&frame->metadata, "3d-plane", buf, 0);
+    }
+
     ret = av_buffersrc_add_frame_flags(ifp->filter, frame,
                                        AV_BUFFERSRC_FLAG_KEEP_REF |
                                        AV_BUFFERSRC_FLAG_PUSH);
@@ -706,6 +717,10 @@ static int ifilter_bind_ist(InputFilter *ifilter, InputStream *ist,
         ifp->format = AV_PIX_FMT_RGB32;
 
         ifp->time_base = AV_TIME_BASE_Q;
+
+        /* Store 3d-plane metadata for MVC 3D subtitle depth offsets */
+        ifp->sub2video.plane_3d       = ifp->opts.sub2video_3d_plane;
+        ifp->sub2video.plane_3d_valid = ifp->opts.sub2video_3d_plane_valid;
 
         av_log(fgp, AV_LOG_VERBOSE, "sub2video: using %dx%d canvas\n",
                ifp->width, ifp->height);

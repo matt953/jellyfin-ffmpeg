@@ -64,6 +64,8 @@ struct JMDecoderContext {
 
     volatile int finished;
     volatile int error;
+
+    int sbs_frame_index;   /* Counter for OFMD offset lookup */
 };
 
 /* ---- NEON-optimized uint16 -> uint8 saturating narrow ---- */
@@ -205,7 +207,7 @@ static void combine_and_enqueue(JMDecoderContext *ctx,
     int h   = view0->height;
     int hw  = w / 2;  /* chroma width per view */
     int hh  = h / 2;  /* chroma height */
-    int y;
+    int y, i;
 
     memset(&sbs, 0, sizeof(sbs));
     sbs.width  = w;
@@ -215,6 +217,19 @@ static void combine_and_enqueue(JMDecoderContext *ctx,
     sbs.strides[0] = w * 2;
     sbs.strides[1] = hw * 2;
     sbs.strides[2] = hw * 2;
+
+    /* Look up OFMD offsets for this frame */
+    if (ctx->mt && ctx->mt->splitter.ofmd.valid) {
+        OFMDData *ofmd = &ctx->mt->splitter.ofmd;
+        sbs.ofs_num_planes = ofmd->num_planes;
+        for (i = 0; i < ofmd->num_planes && i < 32; i++) {
+            if (ctx->sbs_frame_index < ofmd->frame_count)
+                sbs.ofs_offsets[i] = ofmd->offsets[i][ctx->sbs_frame_index];
+            else
+                sbs.ofs_offsets[i] = 0;
+        }
+    }
+    ctx->sbs_frame_index++;
 
     /* Y plane */
     sbs.planes[0] = (uint8_t *)malloc(w * 2 * h);

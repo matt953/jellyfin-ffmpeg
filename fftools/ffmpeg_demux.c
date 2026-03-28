@@ -1069,6 +1069,19 @@ int ist_filter_add(InputStream *ist, InputFilter *ifilter, int is_simple,
                 return AVERROR(ENOMEM);
         }
         ds->have_sub2video = 1;
+
+        /* Look for 3d-plane metadata on this subtitle stream (MKV 3D Blu-ray).
+         * Tags are stored as "3d-plane-<lang>" e.g. "3d-plane-eng=0" */
+        {
+            const AVDictionaryEntry *e = NULL;
+            while ((e = av_dict_iterate(ist->st->metadata, e))) {
+                if (!strncmp(e->key, "3d-plane", 8)) {
+                    opts->sub2video_3d_plane = atoi(e->value);
+                    opts->sub2video_3d_plane_valid = 1;
+                    break;
+                }
+            }
+        }
     }
 
     ret = av_frame_copy_props(opts->fallback, ds->decoded_params);

@@ -18,6 +18,10 @@ typedef struct JMDecodedFrame {
     int strides[3];        // Y, U, V strides
     int is_mvc;            // 1 = dual view, views side by side in planes
     int poc;               // picture order count
+
+    // OFMD subtitle depth offsets (per-plane, for this frame)
+    int8_t  ofs_offsets[32]; // offset value per 3D plane (-127 to +127 pixels)
+    int     ofs_num_planes;  // number of valid planes (0 = no OFMD data)
 } JMDecodedFrame;
 
 // Open decoder. decode_all_layers=1 for MVC.

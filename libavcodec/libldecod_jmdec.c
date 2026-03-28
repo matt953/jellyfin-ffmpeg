@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#include "libavutil/buffer.h"
 #include "libavutil/common.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
@@ -223,6 +224,27 @@ static int output_jm_frame(AVCodecContext *avctx, AVFrame *avframe,
     }
 
     avframe->pts = pop_smallest_pts(ctx);
+
+    /* Attach OFMD subtitle depth offsets as side data if available */
+    if (jmframe->ofs_num_planes > 0) {
+        /* Format: 16-byte UUID ("OFMD\0\0\0\0\0\0\0\0\0\0\0\0") +
+         *         1 byte num_planes + N bytes per-plane offsets */
+        int data_size = 16 + 1 + jmframe->ofs_num_planes;
+        AVBufferRef *buf = av_buffer_alloc(data_size);
+        if (buf) {
+            uint8_t *p = buf->data;
+            memset(p, 0, 16);
+            memcpy(p, "OFMD", 4);  /* UUID prefix */
+            p[16] = (uint8_t)jmframe->ofs_num_planes;
+            memcpy(p + 17, jmframe->ofs_offsets, jmframe->ofs_num_planes);
+
+            AVFrameSideData *sd = av_frame_new_side_data_from_buf(
+                avframe, AV_FRAME_DATA_SEI_UNREGISTERED, buf);
+            if (!sd)
+                av_buffer_unref(&buf);
+        }
+    }
+
     return 0;
 }
 

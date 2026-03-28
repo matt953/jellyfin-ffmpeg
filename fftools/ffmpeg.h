@@ -283,6 +283,8 @@ typedef struct InputFilterOptions {
 
     int                 sub2video_width;
     int                 sub2video_height;
+    int                 sub2video_3d_plane;  // 3D subtitle plane index (-1 = not set)
+    int                 sub2video_3d_plane_valid;
 
     // a combination of IFILTER_FLAG_*
     unsigned            flags;
