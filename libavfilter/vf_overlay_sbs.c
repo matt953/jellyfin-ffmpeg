@@ -71,13 +71,16 @@ static int get_ofmd_offset(const AVFrame *video, int plane_idx)
     for (i = 0; i < video->nb_side_data; i++) {
         const AVFrameSideData *sd = video->side_data[i];
         if (sd->type == AV_FRAME_DATA_SEI_UNREGISTERED &&
-            sd->size >= 17 &&
+            sd->size >= 18 &&
             sd->data[0] == 'O' && sd->data[1] == 'F' &&
             sd->data[2] == 'M' && sd->data[3] == 'D') {
             int num_planes = sd->data[16];
+            int swap_eyes  = sd->data[17];
             if (plane_idx >= 0 && plane_idx < num_planes &&
-                sd->size >= 17 + num_planes)
-                return (int)(int8_t)sd->data[17 + plane_idx];
+                sd->size >= 18 + num_planes) {
+                int off = (int)(int8_t)sd->data[18 + plane_idx];
+                return swap_eyes ? -off : off;
+            }
             return 0;
         }
     }

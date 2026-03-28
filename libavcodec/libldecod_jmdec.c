@@ -107,9 +107,9 @@ static av_cold int jmdec_init(AVCodecContext *avctx)
     for (i = 0; i < avctx->nb_coded_side_data; i++) {
         if (avctx->coded_side_data[i].type == AV_PKT_DATA_STEREO3D) {
             const AVStereo3D *stereo = (const AVStereo3D *)avctx->coded_side_data[i].data;
-            if (!(stereo->flags & AV_STEREO3D_FLAG_INVERT)) {
+            if (stereo->flags & AV_STEREO3D_FLAG_INVERT) {
                 ctx->swap_eyes = 1;
-                av_log(avctx, AV_LOG_DEBUG, "Detected block_lr stereo mode, swapping eyes\n");
+                av_log(avctx, AV_LOG_INFO, "Detected block_rl stereo mode, swapping eyes\n");
             }
             break;
         }
@@ -228,15 +228,17 @@ static int output_jm_frame(AVCodecContext *avctx, AVFrame *avframe,
     /* Attach OFMD subtitle depth offsets as side data if available */
     if (jmframe->ofs_num_planes > 0) {
         /* Format: 16-byte UUID ("OFMD\0\0\0\0\0\0\0\0\0\0\0\0") +
-         *         1 byte num_planes + N bytes per-plane offsets */
-        int data_size = 16 + 1 + jmframe->ofs_num_planes;
+         *         1 byte num_planes + 1 byte swap_eyes flag +
+         *         N bytes per-plane offsets */
+        int data_size = 16 + 1 + 1 + jmframe->ofs_num_planes;
         AVBufferRef *buf = av_buffer_alloc(data_size);
         if (buf) {
             uint8_t *p = buf->data;
             memset(p, 0, 16);
             memcpy(p, "OFMD", 4);  /* UUID prefix */
             p[16] = (uint8_t)jmframe->ofs_num_planes;
-            memcpy(p + 17, jmframe->ofs_offsets, jmframe->ofs_num_planes);
+            p[17] = (uint8_t)ctx->swap_eyes;
+            memcpy(p + 18, jmframe->ofs_offsets, jmframe->ofs_num_planes);
 
             AVFrameSideData *sd = av_frame_new_side_data_from_buf(
                 avframe, AV_FRAME_DATA_SEI_UNREGISTERED, buf);
