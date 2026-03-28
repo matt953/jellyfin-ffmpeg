@@ -20,6 +20,7 @@
  */
 
 #include <string.h>
+#include <stdio.h>
 #include <unistd.h>
 
 #include "libavutil/common.h"
@@ -36,7 +37,10 @@
 
 #include "libldecod_jm_bridge.h"
 
-#define PTS_QUEUE_SIZE 128
+/* MT decoder buffers many packets in the ring buffer + NALU splitter pipeline
+ * before the first output frame appears (observed max depth ~464 for a 2-min
+ * clip). 2048 provides comfortable headroom. */
+#define PTS_QUEUE_SIZE 2048
 
 typedef struct JMDecContext {
     AVClass *av_class;
@@ -49,6 +53,12 @@ typedef struct JMDecContext {
 
     int initialized;
     int eof_sent;
+
+    /* Pending packet data not yet fully fed to decoder ring buffer */
+    AVPacket *pending_pkt;
+    int pending_offset;       /* bytes already fed from pending_pkt->data */
+    int pending_side_offset;  /* bytes already fed from side data */
+    int pending_side_done;    /* side data fully fed */
 } JMDecContext;
 
 static void insert_pts_sorted(JMDecContext *ctx, int64_t pts)
@@ -113,8 +123,14 @@ static av_cold int jmdec_init(AVCodecContext *avctx)
 static av_cold int jmdec_close(AVCodecContext *avctx)
 {
     JMDecContext *ctx = avctx->priv_data;
-    if (ctx->jm)
+    fprintf(stderr, "[JMDEC] jmdec_close called\n");
+    if (ctx->jm) {
+        fprintf(stderr, "[JMDEC] calling jm_decoder_flush\n");
+        jm_decoder_flush(ctx->jm);
+        fprintf(stderr, "[JMDEC] calling jm_decoder_close\n");
         jm_decoder_close(ctx->jm);
+        fprintf(stderr, "[JMDEC] jm_decoder_close done\n");
+    }
     ctx->jm = NULL;
     return 0;
 }
@@ -210,17 +226,52 @@ static int output_jm_frame(AVCodecContext *avctx, AVFrame *avframe,
     return 0;
 }
 
-static int jmdec_receive_frame(AVCodecContext *avctx, AVFrame *avframe)
+/* Feed all data from a packet (main + side data) to the decoder.
+ * Uses blocking jm_decoder_feed — called from a helper that ensures
+ * this won't deadlock by running on a separate feeder context. */
+/* Returns 0 on success, -1 if decoder is done (stop feeding) */
+static int feed_full_packet(JMDecoderContext *jm, AVPacket *pkt)
 {
     static const uint8_t start_code[] = {0, 0, 0, 1};
-    JMDecContext *ctx = avctx->priv_data;
-    JMDecodedFrame jmframe;
-    AVPacket *pkt;
-    int ret;
     size_t side_size;
     const uint8_t *side_data;
     const uint8_t *p, *end;
     uint32_t nalu_len;
+
+    /* Feed main packet data */
+    if (pkt->data && pkt->size > 0) {
+        if (jm_decoder_feed(jm, pkt->data, pkt->size) < 0)
+            return -1;
+    }
+
+    /* Feed MVC side data (BlockAdditional) */
+    side_size = 0;
+    side_data = av_packet_get_side_data(pkt,
+        AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL, &side_size);
+    if (side_data && side_size > 8) {
+        p = side_data + 8;
+        end = side_data + side_size;
+        while (p + 4 <= end) {
+            nalu_len = AV_RB32(p);
+            p += 4;
+            if (p + nalu_len > end)
+                break;
+            if (jm_decoder_feed(jm, start_code, 4) < 0)
+                return -1;
+            if (jm_decoder_feed(jm, p, nalu_len) < 0)
+                return -1;
+            p += nalu_len;
+        }
+    }
+    return 0;
+}
+
+static int jmdec_receive_frame(AVCodecContext *avctx, AVFrame *avframe)
+{
+    JMDecContext *ctx = avctx->priv_data;
+    JMDecodedFrame jmframe;
+    AVPacket *pkt;
+    int ret;
 
     /* Check for already-decoded frames first (non-blocking) */
     if (jm_decoder_get_frame(ctx->jm, &jmframe)) {
@@ -239,8 +290,13 @@ static int jmdec_receive_frame(AVCodecContext *avctx, AVFrame *avframe)
         return AVERROR_EOF;
     }
 
-    /* Feed ONE packet, then return EAGAIN so FFmpeg calls us again
-     * (which will check for frames first, preventing deadlock) */
+    /* Feed ONE packet then return EAGAIN.
+     * jm_decoder_feed blocks if ring is full, but the decoder threads
+     * continuously consume from the ring and produce output frames.
+     * The ring buffer (4MB) is large enough to hold many packets,
+     * so blocking here is brief — it only stalls when the decoder
+     * threads are backpressured by the frame queue, which drains
+     * on the next call when we check jm_decoder_get_frame above. */
     pkt = av_packet_alloc();
     if (!pkt)
         return AVERROR(ENOMEM);
@@ -251,7 +307,6 @@ static int jmdec_receive_frame(AVCodecContext *avctx, AVFrame *avframe)
         if (ret == AVERROR_EOF) {
             jm_decoder_flush(ctx->jm);
             ctx->eof_sent = 1;
-            /* Try to get a frame immediately after signaling EOF */
             if (jm_decoder_get_frame_blocking(ctx->jm, &jmframe)) {
                 ret = output_jm_frame(avctx, avframe, &jmframe, ctx);
                 jm_frame_free(&jmframe);
@@ -262,30 +317,32 @@ static int jmdec_receive_frame(AVCodecContext *avctx, AVFrame *avframe)
         return ret;
     }
 
-    insert_pts_sorted(ctx, pkt->pts);
-
-    /* Feed main packet data (already Annex B due to BSF) */
-    if (pkt->data && pkt->size > 0)
-        jm_decoder_feed(ctx->jm, pkt->data, pkt->size);
-
-    /* Feed MVC side data (BlockAdditional) */
-    side_size = 0;
-    side_data = av_packet_get_side_data(pkt,
-        AV_PKT_DATA_MATROSKA_BLOCKADDITIONAL, &side_size);
-    if (side_data && side_size > 8) {
-        p = side_data + 8;
-        end = side_data + side_size;
-        while (p + 4 <= end) {
-            nalu_len = AV_RB32(p);
-            p += 4;
-            if (p + nalu_len > end)
-                break;
-            jm_decoder_feed(ctx->jm, start_code, 4);
-            jm_decoder_feed(ctx->jm, p, nalu_len);
-            p += nalu_len;
+    /* If decoder threads already finished, don't feed — go to drain mode */
+    if (jm_decoder_finished(ctx->jm)) {
+        av_packet_free(&pkt);
+        jm_decoder_flush(ctx->jm);
+        ctx->eof_sent = 1;
+        if (jm_decoder_get_frame_blocking(ctx->jm, &jmframe)) {
+            ret = output_jm_frame(avctx, avframe, &jmframe, ctx);
+            jm_frame_free(&jmframe);
+            return ret;
         }
+        return AVERROR_EOF;
     }
 
+    insert_pts_sorted(ctx, pkt->pts);
+    if (feed_full_packet(ctx->jm, pkt) < 0) {
+        /* Decoder threads finished — switch to drain mode */
+        av_packet_free(&pkt);
+        jm_decoder_flush(ctx->jm);
+        ctx->eof_sent = 1;
+        if (jm_decoder_get_frame_blocking(ctx->jm, &jmframe)) {
+            ret = output_jm_frame(avctx, avframe, &jmframe, ctx);
+            jm_frame_free(&jmframe);
+            return ret;
+        }
+        return AVERROR_EOF;
+    }
     av_packet_free(&pkt);
 
     /* After feeding, check for a frame before returning */

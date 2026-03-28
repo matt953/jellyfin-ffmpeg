@@ -13,6 +13,7 @@
 #include <ldecod/configfile.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -24,16 +25,13 @@
 
 #define RING_BUF_SIZE (4 * 1024 * 1024)
 
-/* ---- POC-based MVC view pairing ---- */
+/* ---- Per-view FIFO queue for MVC view pairing ---- */
 
-#define MAX_PENDING_VIEWS 32
-
-typedef struct {
+typedef struct ViewFrameNode {
     JMDecodedFrame frame;
     int poc;
-    int view_id;   /* 0 or 1 */
-    int valid;
-} PendingView;
+    struct ViewFrameNode *next;
+} ViewFrameNode;
 
 /* ---- Linked-list frame queue (never blocks on enqueue) ---- */
 
@@ -57,9 +55,11 @@ struct JMDecoderContext {
     pthread_mutex_t fq_mutex;
     pthread_cond_t fq_cond;
 
-    /* MVC view pairing by POC — mutex needed because MT mode
-     * calls raw_pic_handler from two threads */
-    PendingView pending[MAX_PENDING_VIEWS];
+    /* FIFO view pairing: each view pushes to its own queue.
+     * When both queues are non-empty, pop one from each, combine SBS, enqueue.
+     * This avoids POC-matching which breaks across GOP boundaries. */
+    ViewFrameNode *view_head[2];  /* Per-view FIFO heads */
+    ViewFrameNode *view_tail[2];  /* Per-view FIFO tails */
     pthread_mutex_t pair_mutex;
 
     volatile int finished;
@@ -149,30 +149,51 @@ static void enqueue_frame(JMDecoderContext *ctx, JMDecodedFrame *frame)
     pthread_mutex_unlock(&ctx->fq_mutex);
 }
 
-/* ---- View pairing helpers ---- */
+/* ---- FIFO view pairing helpers ---- */
 
-/* Find a pending view slot matching the given POC and partner view_id */
-static PendingView *find_pending_partner(JMDecoderContext *ctx, int poc, int partner_view_id)
+/* Push a frame into a per-view FIFO queue */
+static void view_fifo_push(JMDecoderContext *ctx, int view_id, JMDecodedFrame *frame, int poc)
 {
-    int i;
-    for (i = 0; i < MAX_PENDING_VIEWS; i++) {
-        if (ctx->pending[i].valid &&
-            ctx->pending[i].poc == poc &&
-            ctx->pending[i].view_id == partner_view_id)
-            return &ctx->pending[i];
-    }
-    return NULL;
+    ViewFrameNode *node = (ViewFrameNode *)malloc(sizeof(ViewFrameNode));
+    if (!node) return;
+    node->frame = *frame;
+    node->poc = poc;
+    node->next = NULL;
+    if (ctx->view_tail[view_id])
+        ctx->view_tail[view_id]->next = node;
+    else
+        ctx->view_head[view_id] = node;
+    ctx->view_tail[view_id] = node;
 }
 
-/* Find an empty pending view slot */
-static PendingView *find_empty_slot(JMDecoderContext *ctx)
+/* Forward declaration */
+static void combine_and_enqueue(JMDecoderContext *ctx,
+                                JMDecodedFrame *view0, JMDecodedFrame *view1);
+
+/* Try to pair: if both view FIFOs are non-empty, combine and enqueue */
+static void try_pair_views(JMDecoderContext *ctx)
 {
-    int i;
-    for (i = 0; i < MAX_PENDING_VIEWS; i++) {
-        if (!ctx->pending[i].valid)
-            return &ctx->pending[i];
+    while (ctx->view_head[0] && ctx->view_head[1]) {
+        ViewFrameNode *n0 = ctx->view_head[0];
+        ViewFrameNode *n1 = ctx->view_head[1];
+
+        if (n0->poc != n1->poc)
+            fprintf(stderr, "[PAIR] WARNING: view0 poc=%d != view1 poc=%d (FIFO order mismatch)\n",
+                    n0->poc, n1->poc);
+
+        combine_and_enqueue(ctx, &n0->frame, &n1->frame);
+
+        /* Pop both */
+        ctx->view_head[0] = n0->next;
+        if (!ctx->view_head[0]) ctx->view_tail[0] = NULL;
+        jm_frame_free(&n0->frame);
+        free(n0);
+
+        ctx->view_head[1] = n1->next;
+        if (!ctx->view_head[1]) ctx->view_tail[1] = NULL;
+        jm_frame_free(&n1->frame);
+        free(n1);
     }
-    return NULL;
 }
 
 /* Combine two single-view frames into one SBS frame and enqueue */
@@ -235,50 +256,19 @@ static void raw_pic_handler(void *user_data, const RawDecodedPic *pic)
     JMDecoderContext *ctx = (JMDecoderContext *)user_data;
     int view_id = pic->view_id >= 0 ? (pic->view_id & 0xffff) : -1;
     int poc = pic->poc;
-    PendingView *partner;
-    PendingView *slot;
+
+    fprintf(stderr, "[RAW] view_id=%d poc=%d\n", view_id, poc);
 
     pthread_mutex_lock(&ctx->pair_mutex);
 
     if (view_id == 0 || view_id == 1) {
-        int partner_id = view_id ^ 1;  /* 0→1, 1→0 */
+        /* Narrow this view's picture and push to its FIFO */
+        JMDecodedFrame frame;
+        if (narrow_view_to_frame(pic, &frame) < 0) goto done;
+        view_fifo_push(ctx, view_id, &frame, poc);
 
-        /* Check if the partner view is already pending */
-        partner = find_pending_partner(ctx, poc, partner_id);
-        if (partner) {
-            /* Partner found — combine into SBS and enqueue */
-            JMDecodedFrame this_view;
-            if (narrow_view_to_frame(pic, &this_view) < 0) goto done;
-
-            if (view_id == 0) {
-                combine_and_enqueue(ctx, &this_view, &partner->frame);
-            } else {
-                combine_and_enqueue(ctx, &partner->frame, &this_view);
-            }
-
-            /* Clean up both views */
-            jm_frame_free(&this_view);
-            jm_frame_free(&partner->frame);
-            partner->valid = 0;
-        } else {
-            /* No partner yet — store this view as pending */
-            slot = find_empty_slot(ctx);
-            if (!slot) {
-                /* All slots full — flush oldest pending as single view */
-                slot = &ctx->pending[0];
-                fprintf(stderr, "[libldecod_jm] Warning: pending view buffer full, "
-                        "dropping view %d poc %d\n", slot->view_id, slot->poc);
-                jm_frame_free(&slot->frame);
-                slot->valid = 0;
-            }
-            slot->view_id = view_id;
-            slot->poc = poc;
-            slot->valid = 1;
-            if (narrow_view_to_frame(pic, &slot->frame) < 0) {
-                slot->valid = 0;
-                goto done;
-            }
-        }
+        /* Try to pair: if both FIFOs have entries, combine oldest from each */
+        try_pair_views(ctx);
     } else {
         /* Non-MVC frame (view_id < 0) — output as single view */
         JMDecodedFrame frame;
@@ -327,7 +317,9 @@ JMDecoderContext *jm_decoder_open(int decode_all_layers)
     pthread_mutex_init(&ctx->pair_mutex, NULL);
 
     /* Use MT dual-instance decoder: two decoder threads + NALU splitter */
+    fprintf(stderr, "[BRIDGE] About to call OpenDecoderMT\n");
     ctx->mt = OpenDecoderMT(&ctx->inp, RING_BUF_SIZE, &ctx->annex_b);
+    fprintf(stderr, "[BRIDGE] OpenDecoderMT returned %p\n", (void *)ctx->mt);
     if (!ctx->mt) {
         pthread_mutex_destroy(&ctx->fq_mutex);
         pthread_cond_destroy(&ctx->fq_cond);
@@ -339,6 +331,17 @@ JMDecoderContext *jm_decoder_open(int decode_all_layers)
     /* Set raw picture callback — called from both view threads */
     SetRawPicOutputMT(ctx->mt, raw_pic_handler, ctx);
 
+    /* Start threads AFTER callbacks are set */
+    if (StartDecoderMT(ctx->mt) != 0) {
+        CloseDecoderMT(ctx->mt);
+        ctx->mt = NULL;
+        pthread_mutex_destroy(&ctx->fq_mutex);
+        pthread_cond_destroy(&ctx->fq_cond);
+        pthread_mutex_destroy(&ctx->pair_mutex);
+        free(ctx);
+        return NULL;
+    }
+
     return ctx;
 }
 
@@ -346,7 +349,23 @@ int jm_decoder_feed(JMDecoderContext *ctx, const uint8_t *data, int size)
 {
     if (!ctx || !ctx->annex_b || size <= 0)
         return 0;
-    return annex_b_ring_feed(ctx->annex_b, (const byte *)data, size);
+
+    /* Use try_feed in a loop, checking for decoder completion */
+    int offset = 0;
+    while (offset < size) {
+        int ret = annex_b_ring_try_feed(ctx->annex_b,
+                                         (const byte *)data + offset,
+                                         size - offset);
+        if (ret > 0) {
+            offset += ret;
+        } else {
+            /* Ring full — check if decoders finished */
+            if (ctx->mt && ctx->mt->view_finished[0] && ctx->mt->view_finished[1])
+                return -1;
+            usleep(1000);
+        }
+    }
+    return offset;
 }
 
 int jm_decoder_try_feed(JMDecoderContext *ctx, const uint8_t *data, int size)
@@ -405,7 +424,9 @@ void jm_decoder_flush(JMDecoderContext *ctx)
 {
     if (!ctx || !ctx->mt)
         return;
+    fprintf(stderr, "[BRIDGE] jm_decoder_flush: calling FlushDecoderMT\n");
     FlushDecoderMT(ctx->mt);
+    fprintf(stderr, "[BRIDGE] jm_decoder_flush: FlushDecoderMT done\n");
     ctx->finished = 1;
     pthread_mutex_lock(&ctx->fq_mutex);
     pthread_cond_signal(&ctx->fq_cond);
@@ -414,7 +435,12 @@ void jm_decoder_flush(JMDecoderContext *ctx)
 
 int jm_decoder_finished(JMDecoderContext *ctx)
 {
-    return ctx ? ctx->finished : 1;
+    if (!ctx) return 1;
+    if (ctx->finished) return 1;
+    /* Also check if MT decoder threads have finished on their own */
+    if (ctx->mt && ctx->mt->view_finished[0] && ctx->mt->view_finished[1])
+        return 1;
+    return 0;
 }
 
 void jm_frame_free(JMDecodedFrame *frame)
@@ -437,10 +463,15 @@ void jm_decoder_close(JMDecoderContext *ctx)
         CloseDecoderMT(ctx->mt);
         ctx->mt = NULL;
     }
-    /* Free any remaining pending views */
-    for (i = 0; i < MAX_PENDING_VIEWS; i++) {
-        if (ctx->pending[i].valid)
-            jm_frame_free(&ctx->pending[i].frame);
+    /* Free any remaining per-view FIFO entries */
+    for (i = 0; i < 2; i++) {
+        ViewFrameNode *vn = ctx->view_head[i];
+        while (vn) {
+            ViewFrameNode *vnext = vn->next;
+            jm_frame_free(&vn->frame);
+            free(vn);
+            vn = vnext;
+        }
     }
     /* Free remaining queued frames */
     node = ctx->fq_head;
