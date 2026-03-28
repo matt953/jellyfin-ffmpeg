@@ -26,6 +26,7 @@
 #include "libavutil/common.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/stereo3d.h"
 
@@ -36,6 +37,8 @@
 
 #define FRAME_QUEUE_SIZE 32
 #define PTS_QUEUE_SIZE 64
+#define OFMD_MAX_PLANES  32
+#define OFMD_MAX_FRAMES  250000
 
 typedef struct Edge264Context {
     AVClass *av_class;
@@ -56,6 +59,14 @@ typedef struct Edge264Context {
     // DTS queue - FIFO order for decode-order assignment
     int64_t dts_queue[PTS_QUEUE_SIZE];
     int dts_count;
+
+    // OFMD subtitle depth offsets (parsed from SEI NALUs)
+    int      ofmd_valid;
+    int      ofmd_num_planes;
+    int      ofmd_frame_count;
+    int      ofmd_capacity;
+    int8_t  *ofmd_offsets[OFMD_MAX_PLANES];
+    int      sbs_frame_index;
 } Edge264Context;
 
 static av_cold int edge264_decode_close(AVCodecContext *avctx)
@@ -65,6 +76,11 @@ static av_cold int edge264_decode_close(AVCodecContext *avctx)
     while (ctx->queue_head != ctx->queue_tail) {
         av_frame_free(&ctx->frame_queue[ctx->queue_head]);
         ctx->queue_head = (ctx->queue_head + 1) % FRAME_QUEUE_SIZE;
+    }
+
+    for (int i = 0; i < OFMD_MAX_PLANES; i++) {
+        av_free(ctx->ofmd_offsets[i]);
+        ctx->ofmd_offsets[i] = NULL;
     }
 
     if (ctx->decoder)
@@ -86,6 +102,7 @@ static av_cold void edge264_decode_flush(AVCodecContext *avctx)
     // Clear PTS and DTS queues
     ctx->pts_count = 0;
     ctx->dts_count = 0;
+    ctx->sbs_frame_index = 0;
 
     // Flush decoder internal state - edge264 handles keyframe requirements internally
     if (ctx->decoder)
@@ -324,7 +341,119 @@ static int output_frame(AVCodecContext *avctx, AVFrame *avframe,
 
     avframe->flags |= AV_FRAME_FLAG_KEY * (frame->FrameId == 0);
 
+    /* Attach OFMD subtitle depth offsets as side data for overlay_sbs */
+    if (ctx->mvc_output && ctx->ofmd_valid && ctx->ofmd_num_planes > 0) {
+        int num_planes = ctx->ofmd_num_planes;
+        int data_size = 16 + 1 + 1 + num_planes;
+        AVBufferRef *buf = av_buffer_alloc(data_size);
+        if (buf) {
+            uint8_t *p = buf->data;
+            memset(p, 0, 16);
+            memcpy(p, "OFMD", 4);
+            p[16] = (uint8_t)num_planes;
+            p[17] = (uint8_t)!ctx->swap_eyes;
+            for (int i = 0; i < num_planes; i++) {
+                if (ctx->sbs_frame_index < ctx->ofmd_frame_count)
+                    p[18 + i] = (uint8_t)ctx->ofmd_offsets[i][ctx->sbs_frame_index];
+                else
+                    p[18 + i] = 0;
+            }
+            AVFrameSideData *sd = av_frame_new_side_data_from_buf(
+                avframe, AV_FRAME_DATA_SEI_UNREGISTERED, buf);
+            if (!sd)
+                av_buffer_unref(&buf);
+        }
+        ctx->sbs_frame_index++;
+    }
+
     return 0;
+}
+
+/* OFMD (Offset Metadata) parsing for 3D subtitle depth offsets.
+ * Scans SEI NALUs for the "OFMD" magic and accumulates per-plane per-frame offsets. */
+
+static const uint8_t *find_ofmd_magic(const uint8_t *data, int len)
+{
+    for (int i = 0; i <= len - 4; i++) {
+        if (data[i] == 'O' && data[i+1] == 'F' &&
+            data[i+2] == 'M' && data[i+3] == 'D')
+            return data + i;
+    }
+    return NULL;
+}
+
+static void parse_ofmd_payload(Edge264Context *ctx, const uint8_t *ofmd, int remaining)
+{
+    int num_planes, frame_count;
+
+    if (remaining < 14)
+        return;
+
+    int frame_rate = ofmd[4] & 0x0F;
+    if (frame_rate < 1 || frame_rate > 7)
+        return;
+
+    num_planes  = ofmd[10] & 0x7F;
+    frame_count = ofmd[11] & 0x7F;
+
+    if (num_planes <= 0 || num_planes > OFMD_MAX_PLANES || frame_count <= 0)
+        return;
+
+    if (remaining < 14 + num_planes * frame_count)
+        return;
+
+    /* First OFMD message: initialize */
+    if (!ctx->ofmd_valid) {
+        ctx->ofmd_num_planes = num_planes;
+        ctx->ofmd_frame_count = 0;
+        ctx->ofmd_capacity = 4096;
+        for (int i = 0; i < num_planes; i++) {
+            ctx->ofmd_offsets[i] = av_malloc(ctx->ofmd_capacity);
+            if (!ctx->ofmd_offsets[i])
+                return;
+        }
+        ctx->ofmd_valid = 1;
+    }
+
+    /* Grow capacity if needed */
+    if (ctx->ofmd_frame_count + frame_count > ctx->ofmd_capacity) {
+        int new_cap = ctx->ofmd_capacity;
+        while (new_cap < ctx->ofmd_frame_count + frame_count)
+            new_cap *= 2;
+        if (new_cap > OFMD_MAX_FRAMES)
+            new_cap = OFMD_MAX_FRAMES;
+        for (int i = 0; i < ctx->ofmd_num_planes; i++) {
+            int8_t *new_buf = av_realloc(ctx->ofmd_offsets[i], new_cap);
+            if (!new_buf)
+                return;
+            ctx->ofmd_offsets[i] = new_buf;
+        }
+        ctx->ofmd_capacity = new_cap;
+    }
+
+    /* Append offsets: decode raw byte -> signed */
+    for (int i = 0; i < ctx->ofmd_num_planes && i < num_planes; i++) {
+        const uint8_t *plane_data = ofmd + 14 + i * frame_count;
+        for (int j = 0; j < frame_count; j++) {
+            uint8_t raw = plane_data[j];
+            int8_t val;
+            if (raw <= 127)
+                val = (int8_t)raw;
+            else if (raw == 128)
+                val = 0;
+            else
+                val = (int8_t)(128 - (int)raw);
+            ctx->ofmd_offsets[i][ctx->ofmd_frame_count + j] = val;
+        }
+    }
+    ctx->ofmd_frame_count += frame_count;
+}
+
+static void scan_sei_for_ofmd(Edge264Context *ctx, const uint8_t *nalu, int len)
+{
+    const uint8_t *ofmd = find_ofmd_magic(nalu, len);
+    if (ofmd)
+        parse_ofmd_payload(ctx, ofmd, len - (int)(ofmd - nalu));
 }
 
 static int decode_nal_units_collect_frames(Edge264Decoder *decoder, const uint8_t *data, int size,
@@ -346,6 +475,10 @@ static int decode_nal_units_collect_frames(Edge264Decoder *decoder, const uint8_
 
     while (nal < end) {
         const uint8_t *next_start = edge264_find_start_code(nal, end, 0);
+
+        /* Scan SEI NALUs for OFMD subtitle depth offsets */
+        if ((nal[0] & 0x1f) == 6)
+            scan_sei_for_ofmd(ctx, nal, (int)(next_start - nal));
 
         edge264_decode_NAL(decoder, nal, next_start, NULL, NULL);
 
