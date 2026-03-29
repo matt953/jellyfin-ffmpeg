@@ -20,7 +20,10 @@
  */
 
 #include <edge264.h>
+#include <errno.h>
 #include <inttypes.h>
+#include <sched.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "libavutil/common.h"
@@ -39,12 +42,14 @@
 #define PTS_QUEUE_SIZE 64
 #define OFMD_MAX_PLANES  32
 #define OFMD_MAX_FRAMES  250000
+#define NAL_PAD 64
 
 typedef struct Edge264Context {
     AVClass *av_class;
     Edge264Decoder *decoder;
     int mvc_output;  // 0 = base view only, 1 = SBS output
     int swap_eyes;   // swap left/right eye order for SBS output
+    int edge264_threads;  // number of edge264 internal worker threads
 
     // Frame queue for buffered output
     AVFrame *frame_queue[FRAME_QUEUE_SIZE];
@@ -235,7 +240,9 @@ static av_cold int edge264_decode_init(AVCodecContext *avctx)
 {
     Edge264Context *ctx = avctx->priv_data;
 
-    ctx->decoder = edge264_alloc(0, edge264_log_callback, avctx, 0, NULL, NULL, NULL);
+    int n_threads = ctx->edge264_threads;
+    av_log(avctx, AV_LOG_INFO, "edge264: using %d worker threads\n", n_threads);
+    ctx->decoder = edge264_alloc(n_threads, edge264_log_callback, avctx, 0, NULL, NULL, NULL);
     if (!ctx->decoder) {
         av_log(avctx, AV_LOG_ERROR, "Unable to create edge264 decoder\n");
         return AVERROR(ENOMEM);
@@ -456,14 +463,63 @@ static void scan_sei_for_ofmd(Edge264Context *ctx, const uint8_t *nalu, int len)
         parse_ofmd_payload(ctx, ofmd, len - (int)(ofmd - nalu));
 }
 
+/* Allocate a padded copy of a NAL unit for edge264 threaded decoding.
+ * edge264 may read beyond NAL boundaries with SIMD; padding prevents OOB access.
+ * Returns pointer to the NAL data (offset by NAL_PAD from the allocation). */
+static uint8_t *alloc_padded_nal(const uint8_t *src, size_t sz)
+{
+    uint8_t *alloc = malloc(sz + NAL_PAD * 2);
+    if (!alloc)
+        return NULL;
+    memset(alloc, 0xFF, NAL_PAD);
+    memcpy(alloc + NAL_PAD, src, sz);
+    memset(alloc + NAL_PAD + sz, 0xFF, NAL_PAD);
+    return alloc + NAL_PAD;
+}
+
+/* Unref callback for edge264 — called when edge264 is done with the NAL buffer.
+ * On success (ret==0) for slice NALs, edge264 calls this asynchronously.
+ * On error (ret!=0), edge264 does NOT call this — caller must free. */
+static void free_padded_nal(int ret, void *arg)
+{
+    if (arg)
+        free((uint8_t *)arg - NAL_PAD);
+}
+
+/* Drain completed frames from edge264 and queue them.
+ * borrow: 1=normal output, 2=force flush (for ENOBUFS backpressure relief) */
+static int drain_frames(Edge264Decoder *decoder, AVCodecContext *avctx,
+                        Edge264Context *ctx, int borrow)
+{
+    Edge264Frame frame;
+    int frame_count = 0;
+
+    while (edge264_get_frame(decoder, &frame, borrow) == 0) {
+        AVFrame *new_frame = av_frame_alloc();
+        if (!new_frame) {
+            edge264_return_frame(decoder, frame.return_arg);
+            continue;
+        }
+        int ret = output_frame(avctx, new_frame, &frame, ctx);
+        edge264_return_frame(decoder, frame.return_arg);
+        if (ret < 0) {
+            av_frame_free(&new_frame);
+            continue;
+        }
+        queue_frame(ctx, new_frame, frame.FrameId);
+        frame_count++;
+    }
+    return frame_count;
+}
+
 static int decode_nal_units_collect_frames(Edge264Decoder *decoder, const uint8_t *data, int size,
                                            AVCodecContext *avctx, Edge264Context *ctx)
 {
     const uint8_t *nal = data;
     const uint8_t *end = data + size;
     int frame_count = 0;
-    Edge264Frame frame;
-    int ret;
+    Edge264Context *ectx = avctx->priv_data;
+    int use_threading = ectx->edge264_threads > 0;
 
     if (size >= 4 && nal[0] == 0 && nal[1] == 0) {
         if (nal[2] == 1) {
@@ -475,24 +531,45 @@ static int decode_nal_units_collect_frames(Edge264Decoder *decoder, const uint8_
 
     while (nal < end) {
         const uint8_t *next_start = edge264_find_start_code(nal, end, 0);
+        size_t nal_size = next_start - nal;
 
         /* Scan SEI NALUs for OFMD subtitle depth offsets */
         if ((nal[0] & 0x1f) == 6)
-            scan_sei_for_ofmd(ctx, nal, (int)(next_start - nal));
+            scan_sei_for_ofmd(ctx, nal, (int)nal_size);
 
-        edge264_decode_NAL(decoder, nal, next_start, NULL, NULL);
+        if (use_threading) {
+            int ret;
+            do {
+                uint8_t *copy = alloc_padded_nal(nal, nal_size);
+                if (!copy)
+                    break;
+                ret = edge264_decode_NAL(decoder, copy, copy + nal_size,
+                                         free_padded_nal, copy);
+                if (ret != 0)
+                    free((uint8_t *)copy - NAL_PAD);
+                if (ret == ENOBUFS) {
+                    frame_count += drain_frames(decoder, avctx, ctx, 2);
+                    sched_yield();
+                }
+            } while (ret == ENOBUFS);
 
-        while (edge264_get_frame(decoder, &frame, 0) == 0) {
-            AVFrame *new_frame = av_frame_alloc();
-            if (!new_frame)
-                continue;
-            ret = output_frame(avctx, new_frame, &frame, ctx);
-            if (ret < 0) {
-                av_frame_free(&new_frame);
-                continue;
+            frame_count += drain_frames(decoder, avctx, ctx, 1);
+        } else {
+            edge264_decode_NAL(decoder, nal, next_start, NULL, NULL);
+
+            Edge264Frame frame;
+            while (edge264_get_frame(decoder, &frame, 0) == 0) {
+                AVFrame *new_frame = av_frame_alloc();
+                if (!new_frame)
+                    continue;
+                int ret = output_frame(avctx, new_frame, &frame, ctx);
+                if (ret < 0) {
+                    av_frame_free(&new_frame);
+                    continue;
+                }
+                queue_frame(ctx, new_frame, frame.FrameId);
+                frame_count++;
             }
-            queue_frame(ctx, new_frame, frame.FrameId);
-            frame_count++;
         }
 
         nal = next_start;
@@ -534,16 +611,20 @@ static int edge264_decode_frame(AVCodecContext *avctx, AVFrame *avframe,
         }
         // Drain decoder
         edge264_flush(ctx->decoder);
-        while (edge264_get_frame(ctx->decoder, &frame, 0) == 0) {
-            AVFrame *new_frame = av_frame_alloc();
-            if (!new_frame)
-                return AVERROR(ENOMEM);
-            ret = output_frame(avctx, new_frame, &frame, ctx);
-            if (ret < 0) {
-                av_frame_free(&new_frame);
-                return ret;
+        if (ctx->edge264_threads > 0) {
+            drain_frames(ctx->decoder, avctx, ctx, 2);
+        } else {
+            while (edge264_get_frame(ctx->decoder, &frame, 0) == 0) {
+                AVFrame *new_frame = av_frame_alloc();
+                if (!new_frame)
+                    return AVERROR(ENOMEM);
+                ret = output_frame(avctx, new_frame, &frame, ctx);
+                if (ret < 0) {
+                    av_frame_free(&new_frame);
+                    return ret;
+                }
+                queue_frame(ctx, new_frame, frame.FrameId);
             }
-            queue_frame(ctx, new_frame, frame.FrameId);
         }
         queued = dequeue_frame(ctx, &frame_id);
         if (queued) {
@@ -593,6 +674,7 @@ static int edge264_decode_frame(AVCodecContext *avctx, AVFrame *avframe,
 
 static const AVOption options[] = {
     { "mvc_output", "Output MVC as side-by-side", OFFSET(mvc_output), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VD },
+    { "edge264_threads", "Number of edge264 internal worker threads", OFFSET(edge264_threads), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 16, VD },
     { NULL }
 };
 
