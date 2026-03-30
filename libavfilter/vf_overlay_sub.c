@@ -19,10 +19,13 @@
  * or (at your option) any later version.
  */
 
+#include <math.h>
 #include "libavutil/opt.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/pixdesc.h"
+#include "libavutil/csp.h"
 #include "avfilter.h"
+#include "colorspace.h"
 #include "filters.h"
 #include "formats.h"
 #include "framesync.h"
@@ -40,6 +43,7 @@ typedef struct OverlaySubContext {
     int mode;               /* user-selected mode (auto/sbs/2d) */
     int plane;              /* OFMD plane index override (-1 = auto from metadata) */
     int fallback_offset;    /* offset when no OFMD side data present */
+    int sub_brightness;     /* subtitle brightness: -100 to +100, 0 = default */
 
     int video_width;        /* full video width */
     int eye_width;          /* blending width (full for 2D, half for SBS) */
@@ -50,6 +54,13 @@ typedef struct OverlaySubContext {
     int mode_detected;      /* whether detection has happened */
     int auto_plane;         /* plane index detected from subtitle metadata */
     int auto_plane_set;     /* whether auto_plane has been set */
+
+    /* Color properties (detected on first frame) */
+    int color_detected;     /* whether color detection has run */
+    int is_hdr;             /* video uses PQ transfer function */
+    int bit_depth;          /* 8 or 10 */
+    double rgb2yuv[3][3];   /* color-space-aware RGB→YUV matrix */
+    float brightness_scale; /* 1.0 + sub_brightness / 100.0 */
 } OverlaySubContext;
 
 #define OFFSET(x) offsetof(OverlaySubContext, x)
@@ -65,6 +76,8 @@ static const AVOption overlay_sub_options[] = {
       OFFSET(plane), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 31, FLAGS },
     { "fallback_offset", "pixel offset when no OFMD data present",
       OFFSET(fallback_offset), AV_OPT_TYPE_INT, { .i64 = 0 }, -127, 127, FLAGS },
+    { "sub_brightness", "subtitle brightness adjustment (-100 to 100)",
+      OFFSET(sub_brightness), AV_OPT_TYPE_INT, { .i64 = 0 }, -100, 100, FLAGS },
     { "eof_action", "action on subtitle EOF",
       OFFSET(fs.opt_eof_action), AV_OPT_TYPE_INT, { .i64 = EOF_ACTION_PASS },
       EOF_ACTION_REPEAT, EOF_ACTION_PASS, FLAGS, .unit = "eof_action" },
@@ -102,55 +115,100 @@ static int get_ofmd_offset(const AVFrame *video, int plane_idx)
     return 0;  /* no OFMD data */
 }
 
-/* ---- Composite RGBA subtitle onto YUV420P SBS frame ---- */
+/* ---- Detect color properties on first frame ---- */
 
-static void blend_subtitle_onto_eye(AVFrame *dst, const AVFrame *sub,
-                                    int eye_x_offset, int h_offset,
-                                    int eye_width, int eye_height,
-                                    int hsub, int vsub)
+static void detect_color_properties(OverlaySubContext *s, const AVFrame *video,
+                                    AVFilterContext *ctx)
+{
+    const AVPixFmtDescriptor *desc;
+    const AVLumaCoefficients *coeffs;
+
+    if (s->color_detected)
+        return;
+
+    desc = av_pix_fmt_desc_get(video->format);
+    s->bit_depth = desc->comp[0].depth;
+    s->is_hdr = (video->color_trc == AVCOL_TRC_SMPTE2084);
+    s->brightness_scale = 1.0f + s->sub_brightness / 100.0f;
+
+    /* Build RGB→YUV matrix from video's color space */
+    coeffs = av_csp_luma_coeffs_from_avcsp(video->colorspace);
+    if (coeffs)
+        ff_fill_rgb2yuv_table(coeffs, s->rgb2yuv);
+    else
+        ff_fill_rgb2yuv_table(av_csp_luma_coeffs_from_avcsp(AVCOL_SPC_BT709), s->rgb2yuv);
+
+    av_log(ctx, AV_LOG_INFO, "overlay_sub: color detection: %s, %d-bit, colorspace=%d, brightness=%+d%%\n",
+           s->is_hdr ? "HDR10 (PQ)" : "SDR", s->bit_depth, video->colorspace, s->sub_brightness);
+
+    s->color_detected = 1;
+}
+
+/* ---- Composite RGBA subtitle onto YUV frame (8-bit SDR fast path) ---- */
+
+static void blend_subtitle_8bit(AVFrame *dst, const AVFrame *sub,
+                                int eye_x_offset, int h_offset,
+                                int eye_width, int eye_height,
+                                int hsub, int vsub,
+                                float brightness_scale)
 {
     int x, y;
     int sub_w = sub->width;
     int sub_h = sub->height;
     const uint8_t *src_row;
-    uint8_t *dst_y, *dst_u, *dst_v;
     int dst_stride_y = dst->linesize[0];
     int dst_stride_u = dst->linesize[1];
     int dst_stride_v = dst->linesize[2];
     int src_stride   = sub->linesize[0];
+    int use_brightness = (brightness_scale < 0.999f || brightness_scale > 1.001f);
 
     for (y = 0; y < sub_h && y < eye_height; y++) {
         src_row = sub->data[0] + y * src_stride;
-        dst_y = dst->data[0] + y * dst_stride_y + eye_x_offset;
 
         for (x = 0; x < sub_w; x++) {
-            /* RGBA pixel from subtitle */
             uint8_t r = src_row[x * 4 + 0];
             uint8_t g = src_row[x * 4 + 1];
             uint8_t b = src_row[x * 4 + 2];
             uint8_t a = src_row[x * 4 + 3];
+            int Y, U, V;
 
             if (a == 0)
                 continue;
 
-            /* Apply horizontal offset */
             int dx = x + h_offset;
             if (dx < 0 || dx >= eye_width)
                 continue;
 
-            /* Convert RGB to YUV (BT.709) */
-            int Y = (( 47 * r + 157 * g +  16 * b + 128) >> 8) + 16;
-            int U = ((-26 * r -  87 * g + 112 * b + 128) >> 8) + 128;
-            int V = ((112 * r -  102 * g -  10 * b + 128) >> 8) + 128;
+            if (use_brightness) {
+                /* Apply brightness in linear light, then BT.709 */
+                float rf = powf(r / 255.0f, 2.4f) * brightness_scale;
+                float gf = powf(g / 255.0f, 2.4f) * brightness_scale;
+                float bf = powf(b / 255.0f, 2.4f) * brightness_scale;
+                rf = FFMIN(FFMAX(rf, 0.0f), 1.0f);
+                gf = FFMIN(FFMAX(gf, 0.0f), 1.0f);
+                bf = FFMIN(FFMAX(bf, 0.0f), 1.0f);
+                /* Back to gamma */
+                rf = powf(rf, 1.0f / 2.4f);
+                gf = powf(gf, 1.0f / 2.4f);
+                bf = powf(bf, 1.0f / 2.4f);
+                r = (uint8_t)(rf * 255.0f + 0.5f);
+                g = (uint8_t)(gf * 255.0f + 0.5f);
+                b = (uint8_t)(bf * 255.0f + 0.5f);
+            }
 
-            /* Alpha blend Y plane */
+            /* Convert RGB to YUV (BT.709) */
+            Y = (( 47 * r + 157 * g +  16 * b + 128) >> 8) + 16;
+            U = ((-26 * r -  87 * g + 112 * b + 128) >> 8) + 128;
+            V = ((112 * r -  102 * g -  10 * b + 128) >> 8) + 128;
+
+            /* Alpha blend Y */
             int dst_idx = eye_x_offset + dx;
             uint8_t *py = dst->data[0] + y * dst_stride_y + dst_idx;
             *py = (uint8_t)((*py * (255 - a) + Y * a + 127) / 255);
 
-            /* Alpha blend U/V planes (chroma subsampled) */
+            /* Alpha blend U/V (chroma subsampled) */
             if ((y & ((1 << vsub) - 1)) == 0 && (dx & ((1 << hsub) - 1)) == 0) {
-                int cx = (dst_idx) >> hsub;
+                int cx = dst_idx >> hsub;
                 int cy = y >> vsub;
                 uint8_t *pu = dst->data[1] + cy * dst_stride_u + cx;
                 uint8_t *pv = dst->data[2] + cy * dst_stride_v + cx;
@@ -158,6 +216,124 @@ static void blend_subtitle_onto_eye(AVFrame *dst, const AVFrame *sub,
                 *pv = (uint8_t)((*pv * (255 - a) + V * a + 127) / 255);
             }
         }
+    }
+}
+
+/* ---- Composite RGBA subtitle onto 10-bit HDR YUV frame ---- */
+
+static void blend_subtitle_10bit(AVFrame *dst, const AVFrame *sub,
+                                 int eye_x_offset, int h_offset,
+                                 int eye_width, int eye_height,
+                                 int hsub, int vsub,
+                                 const OverlaySubContext *s)
+{
+    int x, y;
+    int sub_w = sub->width;
+    int sub_h = sub->height;
+    const uint8_t *src_row;
+    int dst_stride_y = dst->linesize[0] / 2;  /* stride in uint16_t units */
+    int dst_stride_u = dst->linesize[1] / 2;
+    int dst_stride_v = dst->linesize[2] / 2;
+    int src_stride   = sub->linesize[0];
+    float ref_white;
+
+    /* Compute adjusted reference white for HDR brightness.
+     * Use 203 nits (ITU-R BT.2408 SDR reference white for HDR displays)
+     * as the baseline for mapping SDR subtitle colors into PQ space. */
+    if (s->is_hdr) {
+        ref_white = REFERENCE_WHITE_ALT * s->brightness_scale;
+        ref_white = FFMIN(FFMAX(ref_white, 10.0f), 600.0f);
+    } else {
+        ref_white = REFERENCE_WHITE_ALT;
+    }
+
+    for (y = 0; y < sub_h && y < eye_height; y++) {
+        src_row = sub->data[0] + y * src_stride;
+
+        for (x = 0; x < sub_w; x++) {
+            uint8_t sr = src_row[x * 4 + 0];
+            uint8_t sg = src_row[x * 4 + 1];
+            uint8_t sb = src_row[x * 4 + 2];
+            uint8_t a  = src_row[x * 4 + 3];
+            float rf, gf, bf, Y_f, Cb_f, Cr_f;
+            int Y_out, Cb_out, Cr_out;
+
+            if (a == 0)
+                continue;
+
+            int dx = x + h_offset;
+            if (dx < 0 || dx >= eye_width)
+                continue;
+
+            /* Linearize SDR subtitle (BT.1886 gamma ≈ 2.4) */
+            rf = powf(sr / 255.0f, 2.4f);
+            gf = powf(sg / 255.0f, 2.4f);
+            bf = powf(sb / 255.0f, 2.4f);
+
+            if (!s->is_hdr) {
+                /* 10-bit SDR: apply brightness in linear, back to gamma, matrix */
+                rf *= s->brightness_scale;
+                gf *= s->brightness_scale;
+                bf *= s->brightness_scale;
+                rf = FFMIN(FFMAX(rf, 0.0f), 1.0f);
+                gf = FFMIN(FFMAX(gf, 0.0f), 1.0f);
+                bf = FFMIN(FFMAX(bf, 0.0f), 1.0f);
+                rf = powf(rf, 1.0f / 2.4f);
+                gf = powf(gf, 1.0f / 2.4f);
+                bf = powf(bf, 1.0f / 2.4f);
+            } else {
+                /* HDR: encode linear light to PQ at adjusted reference white */
+                rf = inverse_eotf_st2084(rf, ref_white);
+                gf = inverse_eotf_st2084(gf, ref_white);
+                bf = inverse_eotf_st2084(bf, ref_white);
+            }
+
+            /* RGB→YUV using detected color space matrix */
+            Y_f  = s->rgb2yuv[0][0] * rf + s->rgb2yuv[0][1] * gf + s->rgb2yuv[0][2] * bf;
+            Cb_f = s->rgb2yuv[1][0] * rf + s->rgb2yuv[1][1] * gf + s->rgb2yuv[1][2] * bf;
+            Cr_f = s->rgb2yuv[2][0] * rf + s->rgb2yuv[2][1] * gf + s->rgb2yuv[2][2] * bf;
+
+            /* Quantize to 10-bit limited range */
+            Y_out  = (int)(Y_f  * 876.0f + 0.5f) + 64;   /* 219*4=876, offset=16*4=64 */
+            Cb_out = (int)(Cb_f * 896.0f + 0.5f) + 512;   /* 224*4=896, offset=128*4=512 */
+            Cr_out = (int)(Cr_f * 896.0f + 0.5f) + 512;
+            Y_out  = FFMIN(FFMAX(Y_out, 64), 940);
+            Cb_out = FFMIN(FFMAX(Cb_out, 64), 960);
+            Cr_out = FFMIN(FFMAX(Cr_out, 64), 960);
+
+            /* Alpha blend Y (10-bit) */
+            int dst_idx = eye_x_offset + dx;
+            uint16_t *py = (uint16_t *)dst->data[0] + y * dst_stride_y + dst_idx;
+            *py = (uint16_t)((*py * (255 - a) + Y_out * a + 127) / 255);
+
+            /* Alpha blend U/V (chroma subsampled) */
+            if ((y & ((1 << vsub) - 1)) == 0 && (dx & ((1 << hsub) - 1)) == 0) {
+                int cx = dst_idx >> hsub;
+                int cy = y >> vsub;
+                uint16_t *pu = (uint16_t *)dst->data[1] + cy * dst_stride_u + cx;
+                uint16_t *pv = (uint16_t *)dst->data[2] + cy * dst_stride_v + cx;
+                *pu = (uint16_t)((*pu * (255 - a) + Cb_out * a + 127) / 255);
+                *pv = (uint16_t)((*pv * (255 - a) + Cr_out * a + 127) / 255);
+            }
+        }
+    }
+}
+
+/* ---- Dispatcher: choose blend path based on bit depth ---- */
+
+static void blend_subtitle_onto_eye(AVFrame *dst, const AVFrame *sub,
+                                    int eye_x_offset, int h_offset,
+                                    int eye_width, int eye_height,
+                                    int hsub, int vsub,
+                                    const OverlaySubContext *s)
+{
+    if (s->bit_depth > 8) {
+        blend_subtitle_10bit(dst, sub, eye_x_offset, h_offset,
+                             eye_width, eye_height, hsub, vsub, s);
+    } else {
+        blend_subtitle_8bit(dst, sub, eye_x_offset, h_offset,
+                            eye_width, eye_height, hsub, vsub,
+                            s->brightness_scale);
     }
 }
 
@@ -213,14 +389,15 @@ static int process_frame(FFFrameSync *fs)
     if (!sub)
         return ff_filter_frame(ctx->outputs[0], video);
 
-    /* Detect mode on first subtitle frame */
+    /* Detect mode and color properties on first subtitle frame */
     detect_mode(s, video, sub, ctx);
+    detect_color_properties(s, video, ctx);
 
     if (s->detected_mode == MODE_2D) {
         /* 2D mode: single blend, full width, no offset */
         blend_subtitle_onto_eye(video, sub, 0, 0,
                                 s->eye_width, s->eye_height,
-                                s->hsub, s->vsub);
+                                s->hsub, s->vsub, s);
     } else {
         /* SBS mode: blend both eyes with OFMD depth offset */
         int offset, plane_idx;
@@ -252,12 +429,12 @@ static int process_frame(FFFrameSync *fs)
         /* Composite subtitle onto left eye (x=0, no shift) */
         blend_subtitle_onto_eye(video, sub, 0, 0,
                                 s->eye_width, s->eye_height,
-                                s->hsub, s->vsub);
+                                s->hsub, s->vsub, s);
 
         /* Composite subtitle onto right eye (x=eye_width, with depth offset) */
         blend_subtitle_onto_eye(video, sub, s->eye_width, offset,
                                 s->eye_width, s->eye_height,
-                                s->hsub, s->vsub);
+                                s->hsub, s->vsub, s);
     }
 
     return ff_filter_frame(ctx->outputs[0], video);
@@ -320,25 +497,25 @@ static int query_formats(const AVFilterContext *ctx,
                          AVFilterFormatsConfig **cfg_in,
                          AVFilterFormatsConfig **cfg_out)
 {
-    /* Main input: YUV420P */
+    /* Main input: YUV420P or YUV420P10LE */
     static const enum AVPixelFormat main_fmts[] = {
-        AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE
+        AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV420P10LE, AV_PIX_FMT_NONE
     };
     /* Subtitle input: RGBA (from sub2video) */
     static const enum AVPixelFormat sub_fmts[] = {
         AV_PIX_FMT_RGBA, AV_PIX_FMT_NONE
     };
-    /* Output: YUV420P */
+    /* Output: same as main input */
     int ret;
+    AVFilterFormats *fmts;
 
-    if ((ret = ff_formats_ref(ff_make_format_list(main_fmts),
-                              &cfg_in[0]->formats)) < 0)
+    fmts = ff_make_format_list(main_fmts);
+    if ((ret = ff_formats_ref(fmts, &cfg_in[0]->formats)) < 0)
         return ret;
     if ((ret = ff_formats_ref(ff_make_format_list(sub_fmts),
                               &cfg_in[1]->formats)) < 0)
         return ret;
-    if ((ret = ff_formats_ref(ff_make_format_list(main_fmts),
-                              &cfg_out[0]->formats)) < 0)
+    if ((ret = ff_formats_ref(fmts, &cfg_out[0]->formats)) < 0)
         return ret;
     return 0;
 }
