@@ -348,7 +348,7 @@ static int output_frame(AVCodecContext *avctx, AVFrame *avframe,
 
     avframe->flags |= AV_FRAME_FLAG_KEY * (frame->FrameId == 0);
 
-    /* Attach OFMD subtitle depth offsets as side data for overlay_sbs */
+    /* Attach OFMD subtitle depth offsets as side data for overlay_sub */
     if (ctx->mvc_output && ctx->ofmd_valid && ctx->ofmd_num_planes > 0) {
         int num_planes = ctx->ofmd_num_planes;
         int data_size = 16 + 1 + 1 + num_planes;

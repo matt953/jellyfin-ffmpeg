@@ -325,7 +325,7 @@ static void sub2video_push_ref(InputFilterPriv *ifp, int64_t pts)
     av_assert1(frame->data[0]);
     ifp->sub2video.last_pts = frame->pts = pts;
 
-    /* Propagate 3d-plane metadata for overlay_sbs filter */
+    /* Propagate 3d-plane metadata for overlay_sub filter */
     if (ifp->sub2video.plane_3d_valid) {
         char buf[16];
         snprintf(buf, sizeof(buf), "%d", ifp->sub2video.plane_3d);
