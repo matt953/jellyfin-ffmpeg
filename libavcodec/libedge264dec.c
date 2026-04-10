@@ -41,7 +41,6 @@
 #define FRAME_QUEUE_SIZE 32
 #define PTS_QUEUE_SIZE 64
 #define OFMD_MAX_PLANES  32
-#define OFMD_MAX_FRAMES  250000
 #define NAL_PAD 64
 
 typedef struct Edge264Context {
@@ -427,8 +426,6 @@ static void parse_ofmd_payload(Edge264Context *ctx, const uint8_t *ofmd, int rem
         int new_cap = ctx->ofmd_capacity;
         while (new_cap < ctx->ofmd_frame_count + frame_count)
             new_cap *= 2;
-        if (new_cap > OFMD_MAX_FRAMES)
-            new_cap = OFMD_MAX_FRAMES;
         for (int i = 0; i < ctx->ofmd_num_planes; i++) {
             int8_t *new_buf = av_realloc(ctx->ofmd_offsets[i], new_cap);
             if (!new_buf)
